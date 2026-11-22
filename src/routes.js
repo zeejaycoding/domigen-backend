@@ -22,9 +22,11 @@ import {
 } from './middleware.js'
 import {
   createCheckoutSession,
+  paymentsEnabled,
   paymentPublicConfig,
-  recordPaidSession,
+  recordStripeSession,
   retrieveCheckoutSession,
+  syncStripePayments,
 } from './stripe.js'
 import {
   adminBootstrap,
@@ -43,6 +45,21 @@ async function emitProducts(req) {
 
 async function emitPayments(req) {
   req.app.get('io')?.to('admin').emit('payments', await listPayments())
+}
+
+async function freshAdminPayments(req) {
+  const sync = paymentsEnabled()
+    ? await syncStripePayments(req)
+    : {
+      stripeConfigured: false,
+      checked: 0,
+      paid: 0,
+      updated: 0,
+      removed: 0,
+      syncedAt: new Date().toISOString(),
+    }
+
+  return { payments: await listPayments(), sync }
 }
 
 async function emitUsers(req) {
@@ -89,8 +106,10 @@ router.get('/bootstrap', asyncRoute(async (_req, res) => {
   res.json(await publicBootstrap())
 }))
 
-router.get('/admin/bootstrap', requireAdmin, asyncRoute(async (_req, res) => {
-  res.json(await adminBootstrap())
+router.get('/admin/bootstrap', requireAdmin, asyncRoute(async (req, res) => {
+  const data = await adminBootstrap()
+  const fresh = await freshAdminPayments(req)
+  res.json({ ...data, payments: fresh.payments, paymentSync: fresh.sync })
 }))
 
 // ---------------------------------------------------------------------------
@@ -240,20 +259,21 @@ router.get('/payments/config', (_req, res) => {
   res.json(paymentPublicConfig())
 })
 
+// Admin re-reads Stripe on demand. Every paid row in the payments collection
+// is a mirror of a real Checkout Session; nothing is entered by hand.
+router.post('/admin/payments/sync', requireAdmin, asyncRoute(async (req, res) => {
+  const fresh = await freshAdminPayments(req)
+  res.json({ ...fresh.sync, payments: fresh.payments })
+}))
+
 router.get('/checkout/session/:id', requireMember, asyncRoute(async (req, res) => {
   const session = await retrieveCheckoutSession(req.params.id)
   if (session.metadata?.memberId && String(session.metadata.memberId) !== String(req.member.sub)) {
     return res.status(403).json({ message: 'You cannot view this order.' })
   }
 
-  // Trusted fallback if the webhook has not arrived yet.
-  if (session.payment_status === 'paid') await recordPaidSession(session, req)
-
-  return res.json({
-    paid: session.payment_status === 'paid',
-    product: String(session.metadata?.productTitle || 'DOMIGEN product'),
-    amount: Number(session.amount_total || 0) / 100,
-  })
+  const result = await recordStripeSession(session, req)
+  return res.json(result)
 }))
 
 router.post('/checkout/session', requireMember, asyncRoute(async (req, res) => {
@@ -269,56 +289,47 @@ router.post('/checkout/session', requireMember, asyncRoute(async (req, res) => {
   const session = await createCheckoutSession({
     product: safeProduct,
     member: req.member,
-    wallet: req.body?.wallet === 'applepay' ? 'applepay' : 'card',
     req,
   })
   return res.json({ free: false, ...session })
 }))
 
 // ---------------------------------------------------------------------------
-// Free orders only — paid orders are created by the Stripe webhook
+// Free orders only — every paid order is written exclusively by Stripe data
 // ---------------------------------------------------------------------------
 
 router.post('/payments', requireMember, asyncRoute(async (req, res) => {
-  const productId = req.body?.productId
-  const product = productId ? await findById(collections.products(), productId) : null
-  const free = String(product?.badge || '').toLowerCase() === 'free' || Number(product?.price) === 0
-  if (!free) {
-    return res.status(400).json({ message: 'Use Stripe checkout for paid products.' })
+  const product = req.body?.productId
+    ? await findById(collections.products(), req.body.productId)
+    : null
+  const free = String(product?.badge || '').toLowerCase() === 'free'
+    || Number(product?.price) === 0
+
+  if (!product || !free) {
+    return res.status(400).json({ message: 'Only free applications can be added without Stripe.' })
   }
 
-  const method = 'Free'
-  const title = String(req.body?.product || product?.title || 'DOMIGEN product').trim().slice(0, 120)
-  const amount = free ? 0 : Number(req.body?.amount ?? product?.price ?? 0)
-  const customer = String(
-    req.body?.customer || req.member?.email || '',
-  ).trim().slice(0, 80) || 'Member'
-
-  if (!Number.isFinite(amount) || amount < 0) {
-    return res.status(400).json({ message: 'Invalid payment amount.' })
-  }
+  const customer = String(req.member?.email || '').trim().slice(0, 80)
+  if (!customer) return res.status(401).json({ message: 'Sign in again to claim this application.' })
 
   const doc = {
     id: await nextOrderId(),
     customer,
-    product: title,
-    amount,
-    method,
-    status: free ? 'Completed' : 'Pending',
+    product: String(product.title).trim().slice(0, 120),
+    amount: 0,
+    currency: 'USD',
+    method: 'Free',
+    status: 'Completed',
     date: new Date().toISOString().slice(0, 10),
     createdAt: new Date(),
-    ...(method === 'Card' && /^\d{4}$/.test(String(req.body?.last4 || ''))
-      ? { last4: String(req.body.last4) }
-      : {}),
+    source: 'free-order',
+    productId: product._id,
+    soldCounted: true,
   }
 
   await collections.payments().insertOne(doc)
-
-  if (product?._id) {
-    await collections.products().updateOne({ _id: product._id }, { $inc: { sold: 1 } })
-    await emitProducts(req)
-  }
-
+  await collections.products().updateOne({ _id: product._id }, { $inc: { sold: 1 } })
+  await emitProducts(req)
   await emitPayments(req)
   return res.status(201).json(publicPayment(doc))
 }))
@@ -338,59 +349,9 @@ router.post('/admin/login', (req, res) => {
   return res.json({ token: signAdminToken(email), admin: { email } })
 })
 
-router.get('/admin/payments', requireAdmin, asyncRoute(async (_req, res) => {
-  res.json(await listPayments())
-}))
-
-router.post('/admin/payments', requireAdmin, asyncRoute(async (req, res) => {
-  const customer = String(req.body?.customer || '').trim().slice(0, 80) || 'Manual entry'
-  const product = String(req.body?.product || '').trim().slice(0, 120) || 'DOMIGEN product'
-  const amount = Number(req.body?.amount ?? 0)
-  const method = ['Card', 'Apple Pay', 'Free', 'Manual'].includes(req.body?.method)
-    ? req.body.method
-    : 'Manual'
-  const status = ['Completed', 'Pending', 'Delayed', 'Refunded'].includes(req.body?.status)
-    ? req.body.status
-    : 'Pending'
-
-  if (!Number.isFinite(amount) || amount < 0) {
-    return res.status(400).json({ message: 'Enter a valid amount.' })
-  }
-
-  const doc = {
-    id: await nextOrderId(),
-    customer,
-    product,
-    amount,
-    method,
-    status,
-    date: String(req.body?.date || new Date().toISOString().slice(0, 10)).slice(0, 10),
-    createdAt: new Date(),
-  }
-  await collections.payments().insertOne(doc)
-  await emitPayments(req)
-  return res.status(201).json(publicPayment(doc))
-}))
-
-router.patch('/admin/payments/:id', requireAdmin, asyncRoute(async (req, res) => {
-  const status = String(req.body?.status || '')
-  if (!['Completed', 'Pending', 'Delayed', 'Refunded'].includes(status)) {
-    return res.status(400).json({ message: 'Invalid payment status.' })
-  }
-  const existing = await findById(collections.payments(), req.params.id)
-  if (!existing) return res.status(404).json({ message: 'Payment not found.' })
-
-  await collections.payments().updateOne({ _id: existing._id }, { $set: { status } })
-  await emitPayments(req)
-  return res.json(publicPayment({ ...existing, status }))
-}))
-
-router.delete('/admin/payments/:id', requireAdmin, asyncRoute(async (req, res) => {
-  const existing = await findById(collections.payments(), req.params.id)
-  if (!existing) return res.status(404).json({ message: 'Payment not found.' })
-  await collections.payments().deleteOne({ _id: existing._id })
-  await emitPayments(req)
-  return res.json({ ok: true })
+router.get('/admin/payments', requireAdmin, asyncRoute(async (req, res) => {
+  const fresh = await freshAdminPayments(req)
+  res.json({ ...fresh.sync, payments: fresh.payments })
 }))
 
 router.get('/admin/users', requireAdmin, asyncRoute(async (_req, res) => {

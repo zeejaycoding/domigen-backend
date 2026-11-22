@@ -140,10 +140,12 @@ export function publicPayment(doc) {
   const { _id, ...rest } = doc
   const payment = { ...rest }
   payment.id = payment.id || String(_id)
-  payment.method = payment.method === 'PayPal' ? 'Apple Pay' : payment.method
   payment.amount = asNumber(payment.amount, 0)
-  payment.status = payment.status || 'Pending'
+  payment.status = payment.status || ''
   payment.date = payment.date || new Date().toISOString().slice(0, 10)
+  // Card details are copied only from the Stripe-backed fields.
+  payment.cardBrand = payment.stripeCardBrand || ''
+  payment.cardLast4 = payment.stripeCardLast4 || ''
   return payment
 }
 
