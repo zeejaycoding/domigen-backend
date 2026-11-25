@@ -13,7 +13,12 @@ export function signAdminToken(email) {
 }
 
 export function signMemberToken(user) {
-  return jwt.sign({ role: 'member', sub: String(user._id), email: user.email }, config.jwtSecret, {
+  return jwt.sign({
+    role: 'member',
+    sub: String(user._id),
+    email: user.email,
+    ver: Number(user.passwordVersion || 0),
+  }, config.jwtSecret, {
     expiresIn: '30d',
   })
 }
@@ -50,6 +55,12 @@ export async function requireMember(req, res, next) {
       return res.status(401).json({
         code: 'ACCOUNT_DELETED',
         message: 'This account has been deleted and is no longer available.',
+      })
+    }
+    if (Number(payload.ver || 0) !== Number(user.passwordVersion || 0)) {
+      return res.status(401).json({
+        code: 'ACCOUNT_PASSWORD_CHANGED',
+        message: 'Your password was changed. Please sign in again.',
       })
     }
     if (user.status === 'Suspended' || (!user.status && user.active === false)) {

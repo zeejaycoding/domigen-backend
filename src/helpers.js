@@ -151,7 +151,7 @@ export function publicPayment(doc) {
 
 export function publicUser(doc) {
   if (!doc) return null
-  const { _id, passwordHash, password, ...rest } = doc
+  const { _id, passwordHash, password, passwordVersion, resetTokenHash, resetTokenExpires, ...rest } = doc
   const user = { ...rest }
   user.id = publicId(doc)
   user.name = user.name || user.username || String(user.email || 'Member').split('@')[0]

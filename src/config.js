@@ -28,6 +28,13 @@ export const config = {
   stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET || '',
   checkoutSuccessPath: process.env.CHECKOUT_SUCCESS_PATH || '/checkout/success',
   checkoutCancelPath: process.env.CHECKOUT_CANCEL_PATH || '/checkout/cancel',
+  smtpHost: process.env.SMTP_HOST || '',
+  smtpPort: Number(process.env.SMTP_PORT || 587),
+  smtpSecure: String(process.env.SMTP_SECURE || 'false').toLowerCase() === 'true',
+  smtpUser: process.env.SMTP_USER || '',
+  smtpPass: process.env.SMTP_PASS || '',
+  smtpFrom: process.env.SMTP_FROM || process.env.SMTP_USER || '',
+  resetTokenTtlMinutes: Number(process.env.RESET_TOKEN_TTL_MINUTES || 30),
 }
 
 if (!config.mongoUri) {

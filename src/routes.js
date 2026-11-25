@@ -1,6 +1,8 @@
 import bcrypt from 'bcryptjs'
+import crypto from 'node:crypto'
 import { Router } from 'express'
 import { config } from './config.js'
+import { emailConfigured, sendPasswordResetEmail } from './mailer.js'
 import { getDb, collections } from './db.js'
 import {
   asyncRoute,
@@ -91,6 +93,15 @@ function findDeletedAccountByEmail(email) {
 
 function notifyMember(req, userId, event, message) {
   req.app.get('io')?.to(`member:${String(userId)}`).emit(event, { message })
+}
+
+function hashResetToken(token) {
+  return crypto.createHash('sha256').update(String(token)).digest('hex')
+}
+
+async function passwordMatches(doc, password) {
+  if (doc?.passwordHash && await bcrypt.compare(password, doc.passwordHash)) return true
+  return typeof doc?.password === 'string' && doc.password === password
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +213,7 @@ router.post('/auth/signup', asyncRoute(async (req, res) => {
     email,
     emailLower: email.toLowerCase(),
     passwordHash,
+    passwordVersion: 0,
     role: 'Member',
     status: 'Active',
     joined: new Date().toISOString().slice(0, 10),
@@ -230,11 +242,9 @@ router.post('/auth/signin', asyncRoute(async (req, res) => {
     return res.status(401).json({ message: 'Invalid email or password.' })
   }
 
-  let valid = false
-  if (doc.passwordHash) valid = await bcrypt.compare(password, doc.passwordHash)
-  if (!valid && typeof doc.password === 'string') valid = doc.password === password
-
-  if (!valid) return res.status(401).json({ message: 'Invalid email or password.' })
+  if (!(await passwordMatches(doc, password))) {
+    return res.status(401).json({ message: 'Invalid email or password.' })
+  }
   if (doc.status === 'Suspended' || (!doc.status && doc.active === false)) {
     return res.status(403).json({
       code: 'ACCOUNT_SUSPENDED',
@@ -249,6 +259,112 @@ router.get('/auth/me', requireMember, asyncRoute(async (req, res) => {
   const doc = await findById(collections.users(), req.member.sub)
   if (!doc) return res.status(404).json({ message: 'Account not found.' })
   res.json(publicUser(doc))
+}))
+
+router.post('/auth/change-password', requireMember, asyncRoute(async (req, res) => {
+  const currentPassword = String(req.body?.currentPassword || '')
+  const newPassword = String(req.body?.newPassword || '')
+
+  if (!currentPassword) return res.status(400).json({ message: 'Enter your current password.' })
+  if (newPassword.length < 8) return res.status(400).json({ message: 'New password must be at least 8 characters.' })
+
+  const doc = req.memberUser
+  if (!(await passwordMatches(doc, currentPassword))) {
+    return res.status(400).json({ message: 'Your current password is incorrect.' })
+  }
+
+  const passwordVersion = Number(doc.passwordVersion || 0) + 1
+  await collections.users().updateOne(
+    { _id: doc._id },
+    {
+      $set: {
+        passwordHash: await bcrypt.hash(newPassword, 10),
+        passwordVersion,
+      },
+      $unset: { password: '' },
+    },
+  )
+  await emitUsers(req)
+
+  const updated = { ...doc, passwordHash: undefined, password: undefined, passwordVersion }
+  return res.json({ token: signMemberToken(updated), user: publicUser(updated) })
+}))
+
+router.post('/auth/forgot-password', asyncRoute(async (req, res) => {
+  const email = String(req.body?.email || '').trim()
+  const generic = { message: 'If an account exists for that email, a reset link has been sent.' }
+
+  if (!isEmail(email)) return res.status(400).json({ message: 'Please enter a valid email address.' })
+  if (!emailConfigured()) {
+    return res.status(503).json({ message: 'Password reset email is not configured yet. Please contact support.' })
+  }
+
+  const doc = await findAccountByEmail(email)
+  if (doc) {
+    const token = crypto.randomBytes(32).toString('hex')
+    const minutes = Number.isFinite(config.resetTokenTtlMinutes)
+      ? Math.max(1, config.resetTokenTtlMinutes)
+      : 30
+
+    await collections.users().updateOne(
+      { _id: doc._id },
+      {
+        $set: {
+          resetTokenHash: hashResetToken(token),
+          resetTokenExpires: new Date(Date.now() + minutes * 60 * 1000),
+        },
+      },
+    )
+
+    try {
+      await sendPasswordResetEmail({ to: doc.email, name: doc.name || doc.username, token })
+    } catch (error) {
+      console.error('Password reset email failed:', error)
+      return res.status(502).json({ message: 'We could not send the reset email. Please try again later.' })
+    }
+  }
+
+  return res.json(generic)
+}))
+
+router.post('/auth/reset-password', asyncRoute(async (req, res) => {
+  const token = String(req.body?.token || '').trim()
+  const newPassword = String(req.body?.newPassword || '')
+
+  if (!token) return res.status(400).json({ message: 'This reset link is missing its token.' })
+  if (newPassword.length < 8) return res.status(400).json({ message: 'Password must be at least 8 characters.' })
+
+  const doc = await collections.users().findOne({
+    resetTokenHash: hashResetToken(token),
+    resetTokenExpires: { $gt: new Date() },
+    status: { $ne: 'Deleted' },
+  })
+  if (!doc) return res.status(400).json({ message: 'This reset link is invalid or has expired.' })
+
+  const passwordVersion = Number(doc.passwordVersion || 0) + 1
+  await collections.users().updateOne(
+    { _id: doc._id },
+    {
+      $set: {
+        passwordHash: await bcrypt.hash(newPassword, 10),
+        passwordVersion,
+      },
+      $unset: {
+        password: '',
+        resetTokenHash: '',
+        resetTokenExpires: '',
+      },
+    },
+  )
+  await emitUsers(req)
+  notifyMember(
+    req,
+    doc._id,
+    'account:password-changed',
+    'Your password was reset. Please sign in again.',
+  )
+
+  return res.json({ message: 'Password updated. You can sign in now.' })
 }))
 
 // ---------------------------------------------------------------------------
@@ -380,6 +496,7 @@ router.post('/admin/users', requireAdmin, asyncRoute(async (req, res) => {
     emailLower: email.toLowerCase(),
     password,
     passwordHash: await bcrypt.hash(password, 10),
+    passwordVersion: 0,
     role,
     status: 'Active',
     joined: new Date().toISOString().slice(0, 10),
@@ -405,6 +522,7 @@ router.patch('/admin/users/:id', requireAdmin, asyncRoute(async (req, res) => {
     }
     patch.password = password
     patch.passwordHash = await bcrypt.hash(password, 10)
+    patch.passwordVersion = Number(existing.passwordVersion || 0) + 1
   }
   if (req.body?.role !== undefined && ['Member', 'Admin'].includes(req.body.role)) patch.role = req.body.role
   if (req.body?.status !== undefined && ['Active', 'Suspended'].includes(req.body.status)) {
