@@ -46,6 +46,9 @@ export async function createCheckoutSession({ product, member, req }) {
 
   const session = await stripe.checkout.sessions.create({
     mode: 'payment',
+    // Keep the page in USD only. Without this, Stripe Adaptive Pricing shows
+    // a "Choose currency" line and a converted local amount (for example PKR).
+    adaptive_pricing: { enabled: false },
     // Stripe 2026+ removed `payment_method_types`. This filter keeps the
     // checkout to cards (including the Apple Pay wallet when the domain is
     // verified) and prevents other methods such as PayPal from appearing.
