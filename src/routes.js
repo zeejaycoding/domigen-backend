@@ -13,6 +13,7 @@ import {
   normalizeProductInput,
   publicPayment,
   publicProduct,
+  publicTicket,
   publicUser,
   sanitizeSettings,
 } from './helpers.js'
@@ -77,6 +78,10 @@ function findProductByKey(key) {
   const numeric = Number(key)
   if (Number.isFinite(numeric)) clauses.push({ id: numeric })
   return collections.products().findOne({ $or: clauses })
+}
+
+function exactTextMatch(value) {
+  return new RegExp(`^${String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i')
 }
 
 async function findAccountByEmail(email, statusFilter = { status: { $ne: 'Deleted' } }) {
@@ -259,6 +264,82 @@ router.get('/auth/me', requireMember, asyncRoute(async (req, res) => {
   const doc = await findById(collections.users(), req.member.sub)
   if (!doc) return res.status(404).json({ message: 'Account not found.' })
   res.json(publicUser(doc))
+}))
+
+// Account tab: members own their username and email. Changing the email also
+// refreshes the token so the email claim stays truthful.
+router.put('/auth/account', requireMember, asyncRoute(async (req, res) => {
+  const username = String(req.body?.username ?? req.body?.name ?? '').trim()
+  const email = String(req.body?.email ?? '').trim()
+
+  if (username.length < 3) return res.status(400).json({ message: 'Username needs at least 3 characters.' })
+  if (!isEmail(email)) return res.status(400).json({ message: 'Please enter a valid email address.' })
+
+  const duplicate = await findAccountByEmail(email)
+  if (duplicate && String(duplicate._id) !== String(req.memberUser._id)) {
+    return res.status(409).json({ message: 'That email is already registered.' })
+  }
+
+  const patch = {
+    name: username,
+    username,
+    email,
+    emailLower: email.toLowerCase(),
+  }
+  await collections.users().updateOne({ _id: req.memberUser._id }, { $set: patch })
+  await emitUsers(req)
+
+  const updated = { ...req.memberUser, ...patch }
+  return res.json({ token: signMemberToken(updated), user: publicUser(updated) })
+}))
+
+// My Applications and My Tickets in the signed-in user panel.
+router.get('/member/applications', requireMember, asyncRoute(async (req, res) => {
+  const clauses = [{ memberId: String(req.member.sub) }]
+  const email = String(req.memberUser.email || '').trim()
+  if (email) clauses.push({ customer: exactTextMatch(email) })
+
+  const docs = await collections.payments()
+    .find({ $or: clauses })
+    .sort({ createdAt: -1 })
+    .limit(100)
+    .toArray()
+
+  return res.json(docs.map(publicPayment))
+}))
+
+router.get('/member/tickets', requireMember, asyncRoute(async (req, res) => {
+  const clauses = [{ memberId: String(req.member.sub) }]
+  const email = String(req.memberUser.email || '').trim()
+  if (email) clauses.push({ email: exactTextMatch(email) })
+
+  const docs = await collections.tickets()
+    .find({ $or: clauses })
+    .sort({ createdAt: -1 })
+    .limit(100)
+    .toArray()
+
+  return res.json(docs.map(publicTicket))
+}))
+
+router.post('/member/tickets', requireMember, asyncRoute(async (req, res) => {
+  const subject = String(req.body?.subject || '').trim()
+  const message = String(req.body?.message || '').trim()
+  if (subject.length < 3) return res.status(400).json({ message: 'Enter a subject with at least 3 characters.' })
+  if (message.length < 10) return res.status(400).json({ message: 'Describe your issue in at least 10 characters.' })
+
+  const doc = {
+    memberId: String(req.member.sub),
+    email: String(req.memberUser.email || '').trim(),
+    subject: subject.slice(0, 120),
+    message: message.slice(0, 4000),
+    status: 'Open',
+    date: new Date().toISOString().slice(0, 10),
+    createdAt: new Date(),
+  }
+
+  await collections.tickets().insertOne(doc)
+  return res.status(201).json(publicTicket(doc))
 }))
 
 router.post('/auth/change-password', requireMember, asyncRoute(async (req, res) => {

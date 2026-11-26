@@ -8,6 +8,7 @@ export const collections = {
   products: () => db.collection('products'),
   payments: () => db.collection('payments'),
   users: () => db.collection('users'),
+  tickets: () => db.collection('tickets'),
   settings: () => db.collection('site_settings'),
 }
 
@@ -27,6 +28,8 @@ export async function connectDatabase() {
     collections.payments().createIndex({ id: 1 }, { unique: true }),
     collections.payments().createIndex({ stripeSessionId: 1 }, { unique: true, sparse: true }),
     collections.users().createIndex({ emailLower: 1 }, { unique: true, sparse: true }),
+    collections.tickets().createIndex({ memberId: 1 }),
+    collections.tickets().createIndex({ email: 1 }),
     collections.settings().createIndex({ key: 1 }, { unique: true }),
   ])
 

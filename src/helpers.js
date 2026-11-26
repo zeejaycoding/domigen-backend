@@ -151,7 +151,16 @@ export function publicPayment(doc) {
 
 export function publicUser(doc) {
   if (!doc) return null
-  const { _id, passwordHash, password, passwordVersion, resetTokenHash, resetTokenExpires, ...rest } = doc
+  const {
+    _id,
+    passwordHash,
+    password,
+    passwordVersion,
+    resetTokenHash,
+    resetTokenExpires,
+    notifications,
+    ...rest
+  } = doc
   const user = { ...rest }
   user.id = publicId(doc)
   user.name = user.name || user.username || String(user.email || 'Member').split('@')[0]
@@ -160,6 +169,12 @@ export function publicUser(doc) {
   user.status = user.status || (user.active === false ? 'Suspended' : 'Active')
   user.joined = user.joined || String(user.createdAt || new Date().toISOString()).slice(0, 10)
   return user
+}
+
+export function publicTicket(doc) {
+  if (!doc) return null
+  const { _id, ...rest } = doc
+  return { ...rest, id: String(_id) }
 }
 
 export function publicSettings(doc) {
