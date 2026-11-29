@@ -40,8 +40,15 @@ async function toObjectId(value) {
 }
 
 export async function findById(collection, id) {
+  if (id === undefined || id === null || id === '') return null
+
   const objectId = await toObjectId(id)
-  const clauses = [{ id: String(id) }, { id: asNumber(id, null) }]
+  const clauses = [{ id: String(id) }]
+  const numeric = asNumber(id, null)
+  // NEVER add { id: null }: MongoDB matches missing fields for null, so that
+  // clause would match every document in collections without an `id` field
+  // (tickets), making findOne return the wrong record.
+  if (numeric !== null) clauses.push({ id: numeric })
   if (objectId) clauses.push({ _id: objectId })
   return collection.findOne({ $or: clauses })
 }
@@ -158,6 +165,9 @@ export function publicUser(doc) {
     passwordVersion,
     resetTokenHash,
     resetTokenExpires,
+    emailVerifyTokenHash,
+    emailVerifyExpires,
+    emailVerifySentAt,
     notifications,
     ...rest
   } = doc
@@ -174,7 +184,16 @@ export function publicUser(doc) {
 export function publicTicket(doc) {
   if (!doc) return null
   const { _id, ...rest } = doc
-  return { ...rest, id: String(_id) }
+  return {
+    ...rest,
+    id: String(_id),
+    name: String(rest.name || ''),
+    subject: String(rest.subject || ''),
+    message: String(rest.message || ''),
+    status: ['Open', 'In Progress', 'Closed'].includes(rest.status) ? rest.status : 'Open',
+    response: String(rest.response || ''),
+    date: String(rest.date || String(rest.createdAt || '').slice(0, 10)),
+  }
 }
 
 export function publicSettings(doc) {

@@ -2,7 +2,11 @@ import bcrypt from 'bcryptjs'
 import crypto from 'node:crypto'
 import { Router } from 'express'
 import { config } from './config.js'
-import { emailConfigured, sendPasswordResetEmail } from './mailer.js'
+import {
+  emailConfigured,
+  sendPasswordResetEmail,
+  sendVerificationEmail,
+} from './mailer.js'
 import { getDb, collections } from './db.js'
 import {
   asyncRoute,
@@ -18,8 +22,12 @@ import {
   sanitizeSettings,
 } from './helpers.js'
 import {
+  adminScope,
+  isActiveAdmin,
   requireAdmin,
+  requireFullAdmin,
   requireMember,
+  scopeFromPayload,
   signAdminToken,
   signMemberToken,
 } from './middleware.js'
@@ -36,6 +44,7 @@ import {
   getSettings,
   listPayments,
   listProducts,
+  listTickets,
   listUsers,
   publicBootstrap,
 } from './repository.js'
@@ -69,6 +78,10 @@ async function emitUsers(req) {
   req.app.get('io')?.to('admin').emit('users', await listUsers())
 }
 
+async function emitTickets(req) {
+  req.app.get('io')?.to('admin').emit('tickets', await listTickets())
+}
+
 async function emitSettings(req) {
   req.app.get('io')?.emit('settings', await getSettings())
 }
@@ -96,12 +109,38 @@ function findDeletedAccountByEmail(email) {
   return findAccountByEmail(email, { status: 'Deleted' })
 }
 
+function emitToMember(req, userId, event, payload) {
+  req.app.get('io')?.to(`member:${String(userId)}`).emit(event, payload)
+}
+
 function notifyMember(req, userId, event, message) {
-  req.app.get('io')?.to(`member:${String(userId)}`).emit(event, { message })
+  emitToMember(req, userId, event, { message })
 }
 
 function hashResetToken(token) {
   return crypto.createHash('sha256').update(String(token)).digest('hex')
+}
+
+// Verification links use the same hashed-token pattern as password resets:
+// only the hash is stored, and the token is removed once it has been used.
+function verificationTokenExpiry() {
+  const minutes = Number.isFinite(config.verifyTokenTtlMinutes)
+    ? Math.max(1, config.verifyTokenTtlMinutes)
+    : 60
+  return new Date(Date.now() + minutes * 60 * 1000)
+}
+
+function verificationPatch() {
+  const token = crypto.randomBytes(32).toString('hex')
+  return {
+    token,
+    patch: {
+      emailVerified: false,
+      emailVerifyTokenHash: hashResetToken(token),
+      emailVerifyExpires: verificationTokenExpiry(),
+      emailVerifySentAt: new Date(),
+    },
+  }
 }
 
 async function passwordMatches(doc, password) {
@@ -123,6 +162,12 @@ router.get('/bootstrap', asyncRoute(async (_req, res) => {
 }))
 
 router.get('/admin/bootstrap', requireAdmin, asyncRoute(async (req, res) => {
+  // Product-only admins never receive payments, users, tickets or a Stripe sync.
+  if (scopeFromPayload(req.admin) === 'products') {
+    const [products, settings] = await Promise.all([listProducts(), getSettings()])
+    return res.json({ products, settings, paymentSync: null })
+  }
+
   const data = await adminBootstrap()
   const fresh = await freshAdminPayments(req)
   res.json({ ...data, payments: fresh.payments, paymentSync: fresh.sync })
@@ -181,7 +226,7 @@ router.get('/settings', asyncRoute(async (_req, res) => {
   res.json(await getSettings())
 }))
 
-router.put('/settings', requireAdmin, asyncRoute(async (req, res) => {
+router.put('/settings', requireAdmin, requireFullAdmin, asyncRoute(async (req, res) => {
   const settings = sanitizeSettings(req.body)
   if (settings.name.length < 2) return res.status(400).json({ message: 'Website name needs at least 2 characters.' })
   await collections.settings().updateOne(
@@ -208,9 +253,15 @@ router.post('/auth/signup', asyncRoute(async (req, res) => {
   if (await findAccountByEmail(email)) {
     return res.status(409).json({ message: 'That email is already registered.' })
   }
+  if (!emailConfigured()) {
+    return res.status(503).json({
+      message: 'Email verification is not configured yet. Please contact support.',
+    })
+  }
 
   const id = await nextNumericId(collections.users())
   const passwordHash = await bcrypt.hash(password, 10)
+  const { token, patch } = verificationPatch()
   const doc = {
     id,
     name: username,
@@ -223,11 +274,28 @@ router.post('/auth/signup', asyncRoute(async (req, res) => {
     status: 'Active',
     joined: new Date().toISOString().slice(0, 10),
     createdAt: new Date(),
+    ...patch,
   }
 
-  await collections.users().insertOne(doc)
+  const result = await collections.users().insertOne(doc)
+  try {
+    await sendVerificationEmail({ to: email, name: username, token })
+  } catch (error) {
+    console.error('Verification email failed:', error)
+    // Remove the unfinished account so the member can correct the address and retry.
+    await collections.users().deleteOne({ _id: result.insertedId, emailVerified: false })
+    return res.status(502).json({
+      message: "We couldn't send the verification email. Please check the address and try again.",
+    })
+  }
+
   await emitUsers(req)
-  return res.status(201).json({ token: signMemberToken(doc), user: publicUser(doc) })
+  // No token is returned: the account cannot be used until the link is opened.
+  return res.status(201).json({
+    message: 'Check your email for a verification link before signing in.',
+    email,
+    requiresVerification: true,
+  })
 }))
 
 router.post('/auth/signin', asyncRoute(async (req, res) => {
@@ -250,6 +318,15 @@ router.post('/auth/signin', asyncRoute(async (req, res) => {
   if (!(await passwordMatches(doc, password))) {
     return res.status(401).json({ message: 'Invalid email or password.' })
   }
+  // Accounts created before verification existed (or added by an admin) stay
+  // usable: only an explicit emailVerified: false blocks sign-in.
+  if (doc.emailVerified === false) {
+    return res.status(403).json({
+      code: 'EMAIL_NOT_VERIFIED',
+      message: 'Please verify your email before signing in. Check your inbox for the link.',
+      email: doc.email,
+    })
+  }
   if (doc.status === 'Suspended' || (!doc.status && doc.active === false)) {
     return res.status(403).json({
       code: 'ACCOUNT_SUSPENDED',
@@ -258,6 +335,72 @@ router.post('/auth/signin', asyncRoute(async (req, res) => {
   }
 
   return res.json({ token: signMemberToken(doc), user: publicUser(doc) })
+}))
+
+router.post('/auth/verify-email', asyncRoute(async (req, res) => {
+  const token = String(req.body?.token || '').trim()
+  if (!token) return res.status(400).json({ message: 'This verification link is missing its token.' })
+
+  const doc = await collections.users().findOne({
+    emailVerifyTokenHash: hashResetToken(token),
+    emailVerifyExpires: { $gt: new Date() },
+    status: { $ne: 'Deleted' },
+  })
+  if (!doc) {
+    return res.status(400).json({
+      code: 'INVALID_VERIFICATION_TOKEN',
+      message: 'This verification link is invalid or has expired. Request a new one from the sign-in page.',
+    })
+  }
+
+  await collections.users().updateOne(
+    { _id: doc._id },
+    {
+      $set: { emailVerified: true, verifiedAt: new Date() },
+      $unset: {
+        emailVerifyTokenHash: '',
+        emailVerifyExpires: '',
+        emailVerifySentAt: '',
+      },
+    },
+  )
+  await emitUsers(req)
+
+  return res.json({
+    message: 'Email verified. You can sign in now.',
+    verified: true,
+    email: doc.email,
+  })
+}))
+
+router.post('/auth/resend-verification', asyncRoute(async (req, res) => {
+  const email = String(req.body?.email || '').trim()
+  const generic = { message: 'If that account still needs verification, a new link has been sent.' }
+
+  if (!isEmail(email)) return res.status(400).json({ message: 'Please enter a valid email address.' })
+  if (!emailConfigured()) {
+    return res.status(503).json({ message: 'Email verification is not configured yet. Please contact support.' })
+  }
+
+  const doc = await findAccountByEmail(email)
+  if (!doc || doc.emailVerified !== false) return res.json(generic)
+
+  const lastSent = doc.emailVerifySentAt ? new Date(doc.emailVerifySentAt).getTime() : 0
+  if (Date.now() - lastSent < 60 * 1000) {
+    return res.status(429).json({ message: 'Please wait a minute before requesting another link.' })
+  }
+
+  const { token, patch } = verificationPatch()
+  await collections.users().updateOne({ _id: doc._id }, { $set: patch })
+
+  try {
+    await sendVerificationEmail({ to: doc.email, name: doc.name || doc.username, token })
+  } catch (error) {
+    console.error('Verification email failed:', error)
+    return res.status(502).json({ message: "We couldn't send the verification email. Please try again later." })
+  }
+
+  return res.json(generic)
 }))
 
 router.get('/auth/me', requireMember, asyncRoute(async (req, res) => {
@@ -328,17 +471,34 @@ router.post('/member/tickets', requireMember, asyncRoute(async (req, res) => {
   if (subject.length < 3) return res.status(400).json({ message: 'Enter a subject with at least 3 characters.' })
   if (message.length < 10) return res.status(400).json({ message: 'Describe your issue in at least 10 characters.' })
 
+  const cleanSubject = subject.slice(0, 120)
+  const cleanMessage = message.slice(0, 4000)
+  const recentDuplicate = await collections.tickets().findOne({
+    memberId: String(req.member.sub),
+    subject: cleanSubject,
+    message: cleanMessage,
+    createdAt: { $gte: new Date(Date.now() - 60 * 1000) },
+  })
+  if (recentDuplicate) {
+    return res.status(409).json({
+      message: 'This ticket was just submitted. Please wait a minute before sending it again.',
+    })
+  }
+
   const doc = {
     memberId: String(req.member.sub),
+    name: String(req.memberUser.name || req.memberUser.username || '').trim(),
     email: String(req.memberUser.email || '').trim(),
-    subject: subject.slice(0, 120),
-    message: message.slice(0, 4000),
+    subject: cleanSubject,
+    message: cleanMessage,
     status: 'Open',
+    response: '',
     date: new Date().toISOString().slice(0, 10),
     createdAt: new Date(),
   }
 
   await collections.tickets().insertOne(doc)
+  await emitTickets(req)
   return res.status(201).json(publicTicket(doc))
 }))
 
@@ -458,7 +618,7 @@ router.get('/payments/config', (_req, res) => {
 
 // Admin re-reads Stripe on demand. Every paid row in the payments collection
 // is a mirror of a real Checkout Session; nothing is entered by hand.
-router.post('/admin/payments/sync', requireAdmin, asyncRoute(async (req, res) => {
+router.post('/admin/payments/sync', requireAdmin, requireFullAdmin, asyncRoute(async (req, res) => {
   const fresh = await freshAdminPayments(req)
   res.json({ ...fresh.sync, payments: fresh.payments })
 }))
@@ -535,27 +695,104 @@ router.post('/payments', requireMember, asyncRoute(async (req, res) => {
 // Admin auth / users / payments
 // ---------------------------------------------------------------------------
 
-router.post('/admin/login', (req, res) => {
+router.post('/admin/login', asyncRoute(async (req, res) => {
   const email = String(req.body?.email || '').trim()
   const password = String(req.body?.password || '')
 
-  if (email !== config.adminEmail || password !== config.adminPassword) {
+  // The original single admin account remains available, so existing installs
+  // can still sign in before any users exist in the database.
+  if (email.toLowerCase() === config.adminEmail.toLowerCase() && password === config.adminPassword) {
+    return res.json({
+      token: signAdminToken(config.adminEmail),
+      admin: { email: config.adminEmail, name: 'Admin', scope: 'all' },
+    })
+  }
+
+  const user = await findAccountByEmail(email)
+  if (!user || !await passwordMatches(user, password)) {
     return res.status(401).json({ message: 'Invalid email or password.' })
   }
 
-  return res.json({ token: signAdminToken(email), admin: { email } })
-})
+  if (user.emailVerified === false) {
+    return res.status(403).json({ message: 'Please verify your email before signing in to the admin panel.' })
+  }
+  if (user.status === 'Suspended' || (!user.status && user.active === false)) {
+    return res.status(403).json({ message: 'This admin account is suspended. Please contact support.' })
+  }
+  if (!isActiveAdmin(user)) {
+    return res.status(403).json({ message: 'This account does not have admin access.' })
+  }
 
-router.get('/admin/payments', requireAdmin, asyncRoute(async (req, res) => {
+  return res.json({
+    token: signAdminToken(user.email, user),
+    admin: {
+      email: user.email,
+      name: user.name || user.username || 'Admin',
+      role: 'Admin',
+      scope: adminScope(user.email),
+    },
+  })
+}))
+
+router.get('/admin/payments', requireAdmin, requireFullAdmin, asyncRoute(async (req, res) => {
   const fresh = await freshAdminPayments(req)
   res.json({ ...fresh.sync, payments: fresh.payments })
 }))
 
-router.get('/admin/users', requireAdmin, asyncRoute(async (_req, res) => {
+router.get('/admin/tickets', requireAdmin, requireFullAdmin, asyncRoute(async (_req, res) => {
+  res.json(await listTickets())
+}))
+
+router.patch('/admin/tickets/:id', requireAdmin, requireFullAdmin, asyncRoute(async (req, res) => {
+  const existing = await findById(collections.tickets(), req.params.id)
+  if (!existing) return res.status(404).json({ message: 'Ticket not found.' })
+
+  const patch = {}
+  if (req.body?.status !== undefined) {
+    const status = String(req.body.status).trim()
+    if (!['Open', 'In Progress', 'Closed'].includes(status)) {
+      return res.status(400).json({ message: 'Choose a valid ticket status.' })
+    }
+    patch.status = status
+  }
+  if (req.body?.response !== undefined) {
+    const response = String(req.body.response).trim()
+    if (response.length > 4000) {
+      return res.status(400).json({ message: 'Keep the response under 4000 characters.' })
+    }
+    patch.response = response
+    patch.respondedAt = new Date()
+  }
+  if (!Object.keys(patch).length) {
+    return res.status(400).json({ message: 'There is nothing to update on this ticket.' })
+  }
+
+  if (patch.status === 'Closed') patch.closedAt = new Date()
+  if (patch.status === 'Open' || patch.status === 'In Progress') patch.closedAt = null
+  patch.updatedAt = new Date()
+
+  await collections.tickets().updateOne({ _id: existing._id }, { $set: patch })
+  const updated = publicTicket({ ...existing, ...patch })
+  await emitTickets(req)
+  emitToMember(req, existing.memberId, 'ticket:updated', updated)
+  return res.json(updated)
+}))
+
+router.delete('/admin/tickets/:id', requireAdmin, requireFullAdmin, asyncRoute(async (req, res) => {
+  const existing = await findById(collections.tickets(), req.params.id)
+  if (!existing) return res.status(404).json({ message: 'Ticket not found.' })
+
+  await collections.tickets().deleteOne({ _id: existing._id })
+  await emitTickets(req)
+  emitToMember(req, existing.memberId, 'ticket:deleted', { id: String(existing._id) })
+  return res.json({ ok: true })
+}))
+
+router.get('/admin/users', requireAdmin, requireFullAdmin, asyncRoute(async (_req, res) => {
   res.json(await listUsers())
 }))
 
-router.post('/admin/users', requireAdmin, asyncRoute(async (req, res) => {
+router.post('/admin/users', requireAdmin, requireFullAdmin, asyncRoute(async (req, res) => {
   const name = String(req.body?.name || '').trim()
   const email = String(req.body?.email || '').trim()
   const password = String(req.body?.password || '')
@@ -575,9 +812,11 @@ router.post('/admin/users', requireAdmin, asyncRoute(async (req, res) => {
     username: name,
     email,
     emailLower: email.toLowerCase(),
-    password,
     passwordHash: await bcrypt.hash(password, 10),
     passwordVersion: 0,
+    // Admin-created accounts get their credentials directly, so no email link
+    // is required for them.
+    emailVerified: true,
     role,
     status: 'Active',
     joined: new Date().toISOString().slice(0, 10),
@@ -588,7 +827,7 @@ router.post('/admin/users', requireAdmin, asyncRoute(async (req, res) => {
   return res.status(201).json(publicUser(doc))
 }))
 
-router.patch('/admin/users/:id', requireAdmin, asyncRoute(async (req, res) => {
+router.patch('/admin/users/:id', requireAdmin, requireFullAdmin, asyncRoute(async (req, res) => {
   const existing = await findById(collections.users(), req.params.id)
   if (!existing || existing.status === 'Deleted') {
     return res.status(404).json({ message: 'User not found.' })
@@ -601,7 +840,6 @@ router.patch('/admin/users/:id', requireAdmin, asyncRoute(async (req, res) => {
     if (password.length < 8) {
       return res.status(400).json({ message: 'Password must be at least 8 characters.' })
     }
-    patch.password = password
     patch.passwordHash = await bcrypt.hash(password, 10)
     patch.passwordVersion = Number(existing.passwordVersion || 0) + 1
   }
@@ -645,7 +883,7 @@ router.patch('/admin/users/:id', requireAdmin, asyncRoute(async (req, res) => {
   return res.json(publicUser({ ...existing, ...patch }))
 }))
 
-router.delete('/admin/users/:id', requireAdmin, asyncRoute(async (req, res) => {
+router.delete('/admin/users/:id', requireAdmin, requireFullAdmin, asyncRoute(async (req, res) => {
   const existing = await findById(collections.users(), req.params.id)
   if (!existing || existing.status === 'Deleted') {
     return res.status(404).json({ message: 'User not found.' })

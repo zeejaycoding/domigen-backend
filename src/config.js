@@ -35,6 +35,10 @@ export const config = {
   smtpPass: process.env.SMTP_PASS || '',
   smtpFrom: process.env.SMTP_FROM || process.env.SMTP_USER || '',
   resetTokenTtlMinutes: Number(process.env.RESET_TOKEN_TTL_MINUTES || 30),
+  sendgridApiKey: process.env.SENDGRID_API_KEY || '',
+  // SendGrid requires a sender identity verified in your SendGrid account.
+  emailFrom: process.env.SENDGRID_FROM || process.env.EMAIL_FROM || process.env.SMTP_FROM || process.env.SMTP_USER || '',
+  verifyTokenTtlMinutes: Number(process.env.EMAIL_VERIFY_TTL_MINUTES || 60),
 }
 
 if (!config.mongoUri) {

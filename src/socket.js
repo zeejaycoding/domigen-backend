@@ -1,6 +1,9 @@
 import jwt from 'jsonwebtoken'
 import { Server } from 'socket.io'
 import { config } from './config.js'
+import { collections } from './db.js'
+import { findById } from './helpers.js'
+import { isActiveAdmin, scopeFromPayload } from './middleware.js'
 
 export function setupRealtime(httpServer) {
   const io = new Server(httpServer, {
@@ -16,12 +19,19 @@ export function setupRealtime(httpServer) {
     },
   })
 
-  const authorize = (socket, token) => {
+  const authorize = async (socket, token) => {
     if (!token) return false
     try {
       const payload = jwt.verify(token, config.jwtSecret)
       if (payload.role === 'admin') {
-        socket.join('admin')
+        if (payload.sub) {
+          const user = await findById(collections.users(), payload.sub)
+          if (!user || !isActiveAdmin(user)) return false
+          if (Number(payload.ver || 0) !== Number(user.passwordVersion || 0)) return false
+        }
+        // Product-only admins stay out of the admin room used for payments,
+        // users and tickets. Product updates are emitted publicly already.
+        socket.join(scopeFromPayload(payload) === 'all' ? 'admin' : 'admin-products')
         return true
       }
       if (payload.role === 'member') {
@@ -37,13 +47,13 @@ export function setupRealtime(httpServer) {
   io.on('connection', (socket) => {
     authorize(socket, socket.handshake.auth?.token)
 
-    socket.on('admin:auth', (token) => {
-      const ok = authorize(socket, token)
+    socket.on('admin:auth', async (token) => {
+      const ok = await authorize(socket, token)
       socket.emit('admin:auth:result', { ok })
     })
 
-    socket.on('member:auth', (token) => {
-      const ok = authorize(socket, token)
+    socket.on('member:auth', async (token) => {
+      const ok = await authorize(socket, token)
       socket.emit('member:auth:result', { ok })
     })
   })

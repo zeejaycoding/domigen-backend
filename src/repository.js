@@ -1,5 +1,12 @@
 import { collections } from './db.js'
-import { DEFAULT_SETTINGS, publicPayment, publicProduct, publicSettings, publicUser } from './helpers.js'
+import {
+  DEFAULT_SETTINGS,
+  publicPayment,
+  publicProduct,
+  publicSettings,
+  publicTicket,
+  publicUser,
+} from './helpers.js'
 
 export async function listProducts() {
   const docs = await collections.products().find({}).sort({ _id: 1 }).toArray()
@@ -19,6 +26,15 @@ export async function listUsers() {
   return docs.map(publicUser)
 }
 
+export async function listTickets() {
+  const docs = await collections.tickets()
+    .find({})
+    .sort({ createdAt: -1, _id: -1 })
+    .limit(500)
+    .toArray()
+  return docs.map(publicTicket)
+}
+
 export async function getSettings() {
   const doc = await collections.settings().findOne({ key: 'site' })
   return publicSettings(doc)
@@ -30,11 +46,12 @@ export async function publicBootstrap() {
 }
 
 export async function adminBootstrap() {
-  const [products, payments, users, settings] = await Promise.all([
+  const [products, payments, users, tickets, settings] = await Promise.all([
     listProducts(),
     listPayments(),
     listUsers(),
+    listTickets(),
     getSettings(),
   ])
-  return { products, payments, users, settings, defaults: DEFAULT_SETTINGS }
+  return { products, payments, users, tickets, settings, defaults: DEFAULT_SETTINGS }
 }
